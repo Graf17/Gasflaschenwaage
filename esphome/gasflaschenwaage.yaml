@@ -1,0 +1,299 @@
+substitutions:
+  device_name: gasflaschenwaage
+  friendly_name: Gasflaschenwaage
+
+  # Low-power Zyklus
+  awake_max_duration: 5min
+  sleep_duration: 24h
+
+  # HX711-Pins (aktuelles Wiring)
+  hx711_dout_pin: GPIO16
+  hx711_sck_pin: GPIO17
+
+  # Gewichtsparameter
+  bottle_empty_kg: "6.6"
+  gas_nominal_kg: "5.0"
+
+  # Akkuparameter (MAX17048 ueber I2C)
+  i2c_sda_pin: GPIO19
+  i2c_scl_pin: GPIO18
+  battery_low_pct: "15.0"
+  battery_critical_pct: "8.0"
+
+  # Kalibrierpunkte fuer den HX711
+  calib_raw_no_load: "0.0"
+  calib_kg_no_load: "0.0"
+  calib_raw_known: "22005.666"
+  calib_kg_known: "1.0"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.5.0
+  on_boot:
+    priority: 1000
+    then:
+      - switch.turn_on: i2c_power_en
+      - delay: 8s # Laengere Wartezeit fuer stabile I2C-Versorgung am Feather
+      - component.update: battery_gauge
+      - script.execute: publish_then_sleep
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+globals:
+  - id: battery_cache_valid
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: battery_cache_v
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: battery_cache_pct
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+logger:
+  baud_rate: 115200
+  level: DEBUG
+
+i2c:
+  id: i2c_bus_main
+  sda: ${i2c_sda_pin}
+  scl: ${i2c_scl_pin}
+  frequency: 100kHz
+  scan: true
+
+switch:
+  - platform: gpio
+    id: i2c_power_en
+    internal: true
+    restore_mode: ALWAYS_ON
+    pin:
+      number: GPIO20
+      mode: OUTPUT
+
+zigbee:
+  id: zigbee_radio
+  model: ${friendly_name}
+  router: false
+  power_source: BATTERY
+
+deep_sleep:
+  id: deep_sleep_control
+  run_duration: ${awake_max_duration}
+  sleep_duration: ${sleep_duration}
+
+script:
+  - id: publish_then_sleep
+    mode: restart
+    then:
+      # Warte auf gueltige Sensorwerte, bevor geschlafen wird.
+      - wait_until:
+          timeout: 120s
+          condition:
+            lambda: |-
+              return id(scale_total_kg).has_state() && !std::isnan(id(scale_total_kg).state) &&
+                     id(gas_weight_kg).has_state() && !std::isnan(id(gas_weight_kg).state) &&
+                     id(gas_fill_pct).has_state() && !std::isnan(id(gas_fill_pct).state) &&
+                     id(battery_voltage).has_state() && !std::isnan(id(battery_voltage).state) &&
+                     id(battery_pct).has_state() && !std::isnan(id(battery_pct).state);
+      # Kurzes Fenster fuer Zigbee-Publish geben.
+      - delay: 20s
+      - switch.turn_off: i2c_power_en
+      - delay: 200ms
+      - deep_sleep.enter: deep_sleep_control
+
+sensor:
+  - platform: hx711
+    id: scale_total_kg_raw
+    internal: true
+    dout_pin: ${hx711_dout_pin}
+    clk_pin: ${hx711_sck_pin}
+    gain: 128
+    update_interval: 2s
+    filters:
+      - calibrate_linear:
+          - ${calib_raw_no_load} -> ${calib_kg_no_load}
+          - ${calib_raw_known} -> ${calib_kg_known}
+      - median:
+          window_size: 7
+          send_every: 3
+          send_first_at: 1
+
+  - platform: template
+    id: scale_total_kg
+    name: "${friendly_name} Gesamtgewicht"
+    unit_of_measurement: "kg"
+    accuracy_decimals: 2
+    device_class: weight
+    state_class: measurement
+    update_interval: 2s # Schneller Update-Takt fuer reaktive HA-Anzeige
+    lambda: |-
+      if (std::isnan(id(scale_total_kg_raw).state)) return {};
+      return id(scale_total_kg_raw).state;
+    filters:
+      - round: 2
+    zigbee_id: zigbee_radio
+    report: force
+
+  - platform: max17043
+    id: battery_gauge
+    i2c_id: i2c_bus_main
+    address: 0x36
+    update_interval: never
+    battery_voltage:
+      id: battery_voltage_raw
+      internal: true
+      filters:
+        - filter_out: NAN # Unterdrueckt ungueltige Messwerte (NaN)
+        - round: 2
+      on_value:
+        then:
+          - lambda: |-
+              id(battery_cache_v) = x;
+              id(battery_cache_valid) = true;
+    battery_level:
+      id: battery_pct_raw
+      internal: true
+      filters:
+        - filter_out: NAN
+        - clamp:
+            min_value: 0.0
+            max_value: 100.0
+        - round: 1
+      on_value:
+        then:
+          - lambda: |-
+              id(battery_cache_pct) = x;
+              id(battery_cache_valid) = true;
+
+  - platform: template
+    id: battery_voltage
+    name: "${friendly_name} Akkuspannung"
+    unit_of_measurement: "V"
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      if (id(battery_voltage_raw).has_state() && !std::isnan(id(battery_voltage_raw).state)) {
+        return id(battery_voltage_raw).state;
+      }
+      if (id(battery_cache_valid)) {
+        return id(battery_cache_v);
+      }
+      return 0.0f;
+    filters:
+      - round: 2
+    zigbee_id: zigbee_radio
+    report: force
+
+  - platform: template
+    id: battery_pct
+    name: "${friendly_name} Akkustand"
+    unit_of_measurement: "%"
+    accuracy_decimals: 1
+    device_class: battery
+    state_class: measurement
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      if (id(battery_pct_raw).has_state() && !std::isnan(id(battery_pct_raw).state)) {
+        return id(battery_pct_raw).state;
+      }
+      if (id(battery_cache_valid)) {
+        return id(battery_cache_pct);
+      }
+      return 0.0f;
+    filters:
+      - round: 1
+    zigbee_id: zigbee_radio
+    report: force
+
+  - platform: template
+    id: gas_weight_kg
+    name: "${friendly_name} Gasgewicht"
+    unit_of_measurement: "kg"
+    accuracy_decimals: 2
+    device_class: weight
+    state_class: measurement
+    update_interval: 2s # Schneller Update-Takt
+    lambda: |-
+      if (std::isnan(id(scale_total_kg_raw).state)) return {};
+      float gas = id(scale_total_kg_raw).state - ${bottle_empty_kg}f;
+      if (gas < 0.0f) return 0.0f;
+      return gas;
+    filters:
+      - round: 2
+    zigbee_id: zigbee_radio
+    report: force
+
+  - platform: template
+    id: gas_fill_pct
+    name: "${friendly_name} Fuellstand"
+    unit_of_measurement: "%"
+    accuracy_decimals: 2
+    state_class: measurement
+    icon: mdi:propane-tank
+    update_interval: 2s # Schneller Update-Takt
+    lambda: |-
+      if (std::isnan(id(gas_weight_kg).state)) return {};
+      float pct = (id(gas_weight_kg).state / ${gas_nominal_kg}) * 100.0f;
+      return std::clamp(pct, 0.0f, 100.0f);
+    filters:
+      - round: 2
+    zigbee_id: zigbee_radio
+    report: force
+
+binary_sensor:
+  - platform: template
+    id: gas_low_20
+    name: "${friendly_name} Gas niedrig"
+    device_class: problem
+    lambda: |-
+      if (std::isnan(id(gas_fill_pct).state)) return false;
+      return id(gas_fill_pct).state <= 20.0f;
+    zigbee_id: zigbee_radio
+    report: force
+
+  - platform: template
+    id: gas_critical_10
+    name: "${friendly_name} Gas kritisch"
+    device_class: problem
+    lambda: |-
+      if (std::isnan(id(gas_fill_pct).state)) return false;
+      return id(gas_fill_pct).state <= 10.0f;
+    zigbee_id: zigbee_radio
+    report: force
+
+  - platform: template
+    id: battery_low
+    name: "${friendly_name} Akku niedrig"
+    device_class: battery
+    lambda: |-
+      if (std::isnan(id(battery_pct).state)) return false; // NaN als false behandeln
+      return id(battery_pct).state <= ${battery_low_pct};
+    zigbee_id: zigbee_radio
+    report: force
+
+  - platform: template
+    id: battery_critical
+    name: "${friendly_name} Akku kritisch"
+    device_class: battery
+    lambda: |-
+      if (std::isnan(id(battery_pct).state)) return false; // NaN als false behandeln
+      return id(battery_pct).state <= ${battery_critical_pct};
+    zigbee_id: zigbee_radio
+    report: force
+
+interval:
+  - interval: 30s
+    then:
+      - component.update: battery_gauge
