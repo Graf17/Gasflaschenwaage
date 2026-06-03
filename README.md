@@ -9,10 +9,10 @@ Zusatz: Das Testprogramm liest auch den internen Akku-Fuel-Gauge (MAX17048) des 
 
 ## Verdrahtung
 
-- HX711 `VCC` -> 3V
-- HX711 `GND` -> GND
-- HX711 `DOUT` -> TX (GPIO16)
-- HX711 `SCK` -> RX (GPIO17)
+- HX711 `VCC` -> Feather `3V`
+- HX711 `GND` -> Feather `GND`
+- HX711 `DOUT` -> Feather `TX` (GPIO16)
+- HX711 `SCK` -> Feather `RX` (GPIO17)
 
 Wichtig: Je nach Board-Revision und Aufbau musst du ggf. andere GPIOs verwenden.
 
