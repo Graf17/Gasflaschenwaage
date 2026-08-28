@@ -4,17 +4,18 @@ substitutions:
 
   # Low-power Zyklus
   awake_max_duration: 5min
-  sleep_duration: 24h
+  sleep_duration: 10min
+  debug_keep_awake: "false"
 
-  # HX711-Pins (aktuelles Wiring)
-  hx711_dout_pin: GPIO16
-  hx711_sck_pin: GPIO17
+  # HX711-Pins
+  hx711_dout_pin: "16"
+  hx711_sck_pin: "17"
 
   # Gewichtsparameter
   bottle_empty_kg: "6.6"
   gas_nominal_kg: "5.0"
 
-  # Akkuparameter (MAX17048 ueber I2C)
+  # Akkuparameter (MAX17043 ueber I2C)
   i2c_sda_pin: GPIO19
   i2c_scl_pin: GPIO18
   battery_low_pct: "15.0"
@@ -33,10 +34,28 @@ esphome:
   on_boot:
     priority: 1000
     then:
-      - switch.turn_on: i2c_power_en
-      - delay: 8s # Laengere Wartezeit fuer stabile I2C-Versorgung am Feather
+      # Release any previous GPIO hold that might persist from deep sleep
+      - lambda: |-
+          #include "driver/gpio.h"
+          gpio_num_t sck_pin = (gpio_num_t)${hx711_sck_pin};
+          gpio_hold_dis(sck_pin);
+          gpio_num_t i2c_power_pin = GPIO_NUM_20;
+          gpio_set_direction(i2c_power_pin, GPIO_MODE_OUTPUT);
+          gpio_set_level(i2c_power_pin, 1);
+      - if:
+          condition:
+            lambda: 'return ${debug_keep_awake};'
+          then:
+            - deep_sleep.prevent: deep_sleep_control
+            - logger.log:
+                level: WARN
+                format: "Debug-Modus: Deep Sleep ist deaktiviert"
+      # Give the I2C rail time to come up before reading the fuel gauge
+      - delay: 3s
+      # Trigger battery gauge read before starting the publish script
       - component.update: battery_gauge
-      - script.execute: publish_then_sleep
+      - delay: 500ms
+      - script.execute: publish_after_zigbee_join
 
 esp32:
   board: esp32-c6-devkitc-1
@@ -45,7 +64,11 @@ esp32:
     type: esp-idf
 
 globals:
-  - id: battery_cache_valid
+  - id: battery_voltage_valid
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: battery_pct_valid
     type: bool
     restore_value: no
     initial_value: "false"
@@ -57,6 +80,10 @@ globals:
     type: float
     restore_value: no
     initial_value: "0.0"
+  - id: scale_ready
+    type: bool
+    restore_value: no
+    initial_value: "false"
 
 logger:
   baud_rate: 115200
@@ -69,20 +96,16 @@ i2c:
   frequency: 100kHz
   scan: true
 
-switch:
-  - platform: gpio
-    id: i2c_power_en
-    internal: true
-    restore_mode: ALWAYS_ON
-    pin:
-      number: GPIO20
-      mode: OUTPUT
-
 zigbee:
   id: zigbee_radio
   model: ${friendly_name}
   router: false
   power_source: BATTERY
+  on_join:
+    then:
+      - logger.log:
+          format: "Zigbee beigetreten (factory_new=%s)"
+          args: ['x ? "true" : "false"']
 
 deep_sleep:
   id: deep_sleep_control
@@ -90,41 +113,204 @@ deep_sleep:
   sleep_duration: ${sleep_duration}
 
 script:
+  - id: publish_after_zigbee_join
+    mode: single
+    then:
+      - wait_until:
+          condition:
+            lambda: 'return id(zigbee_radio).is_joined();'
+          timeout: 2min
+      - if:
+          condition:
+            lambda: 'return id(zigbee_radio).is_joined();'
+          then:
+            # Ensure every Zigbee attribute changes after the coordinator is ready.
+            - sensor.template.publish:
+                id: scale_total_kg
+                state: -1.0
+            - sensor.template.publish:
+                id: gas_weight_kg
+                state: -1.0
+            - sensor.template.publish:
+                id: gas_fill_pct
+                state: -1.0
+            - sensor.template.publish:
+                id: battery_voltage
+                state: -1.0
+            - sensor.template.publish:
+                id: battery_pct
+                state: -1.0
+            - binary_sensor.template.publish:
+                id: gas_low_20
+                state: false
+            - delay: 1s
+            - binary_sensor.template.publish:
+                id: gas_critical_10
+                state: false
+            - delay: 1s
+            - binary_sensor.template.publish:
+                id: battery_low
+                state: true
+            - delay: 1s
+            - binary_sensor.template.publish:
+                id: battery_critical
+                state: true
+            - delay: 1s
+            - script.execute: publish_then_sleep
+          else:
+            - logger.log:
+                level: WARN
+                format: "Zigbee-Join-Timeout: Messwerte werden erneut versucht"
+
   - id: publish_then_sleep
     mode: restart
     then:
-      # Warte auf gueltige Sensorwerte, bevor geschlafen wird.
+      # kurze Wartezeit, damit Komponenten initialisiert sind
+      - delay: 500ms
+
+      # Reset readiness flag
+      - lambda: |-
+          id(scale_ready) = false;
+
+      # 1) Trigger HX711 Messungen (HX711 setzt scale_ready in on_value)
+      - logger.log: "Trigger HX711 read..."
+      - component.update: scale_total_kg_raw
+
+      # 2) Warten bis HX711 ein gültiges, gefiltertes Ergebnis geliefert hat
       - wait_until:
-          timeout: 120s
           condition:
-            lambda: |-
-              return id(scale_total_kg).has_state() && !std::isnan(id(scale_total_kg).state) &&
-                     id(gas_weight_kg).has_state() && !std::isnan(id(gas_weight_kg).state) &&
-                     id(gas_fill_pct).has_state() && !std::isnan(id(gas_fill_pct).state) &&
-                     id(battery_voltage).has_state() && !std::isnan(id(battery_voltage).state) &&
-                     id(battery_pct).has_state() && !std::isnan(id(battery_pct).state);
-      # Kurzes Fenster fuer Zigbee-Publish geben.
-      - delay: 20s
-      - switch.turn_off: i2c_power_en
-      - delay: 200ms
-      - deep_sleep.enter: deep_sleep_control
+            lambda: 'return id(scale_ready);'
+          timeout: 10s
+
+      # 3) Gewicht und Gaswarnungen nur mit bestaetigter HX711-Messung publizieren
+      - if:
+          condition:
+            lambda: 'return id(scale_ready);'
+          then:
+            - logger.log: "HX711 ready, aktualisiere Gewichtssensoren..."
+            - sensor.template.publish:
+                id: scale_total_kg
+                state: !lambda |-
+                  return id(scale_total_kg_raw).state;
+            - sensor.template.publish:
+                id: gas_weight_kg
+                state: !lambda |-
+                  const float empty_kg = ${bottle_empty_kg}f;
+                  return std::max(id(scale_total_kg_raw).state - empty_kg, 0.0f);
+            - sensor.template.publish:
+                id: gas_fill_pct
+                state: !lambda |-
+                  const float empty_kg = ${bottle_empty_kg}f;
+                  const float nominal_kg = ${gas_nominal_kg}f;
+                  const float gas_kg = std::max(id(scale_total_kg_raw).state - empty_kg, 0.0f);
+                  return std::clamp((gas_kg / nominal_kg) * 100.0f, 0.0f, 100.0f);
+            - logger.log:
+                format: "Gas: %.2f kg, %.1f %%, niedrig=%s, kritisch=%s"
+                args:
+                  - "std::max(id(scale_total_kg_raw).state - ${bottle_empty_kg}f, 0.0f)"
+                  - "std::clamp((std::max(id(scale_total_kg_raw).state - ${bottle_empty_kg}f, 0.0f) / ${gas_nominal_kg}f) * 100.0f, 0.0f, 100.0f)"
+                  - "std::clamp((std::max(id(scale_total_kg_raw).state - ${bottle_empty_kg}f, 0.0f) / ${gas_nominal_kg}f) * 100.0f, 0.0f, 100.0f) <= 20.0f ? \"true\" : \"false\""
+                  - "std::clamp((std::max(id(scale_total_kg_raw).state - ${bottle_empty_kg}f, 0.0f) / ${gas_nominal_kg}f) * 100.0f, 0.0f, 100.0f) <= 10.0f ? \"true\" : \"false\""
+            - binary_sensor.template.publish:
+                id: gas_low_20
+                state: !lambda |-
+                  const float empty_kg = ${bottle_empty_kg}f;
+                  const float nominal_kg = ${gas_nominal_kg}f;
+                  const float gas_kg = std::max(id(scale_total_kg_raw).state - empty_kg, 0.0f);
+                  const float gas_pct = std::clamp((gas_kg / nominal_kg) * 100.0f, 0.0f, 100.0f);
+                  return gas_pct <= 20.0f;
+            - delay: 1s
+            - binary_sensor.template.publish:
+                id: gas_critical_10
+                state: !lambda |-
+                  const float empty_kg = ${bottle_empty_kg}f;
+                  const float nominal_kg = ${gas_nominal_kg}f;
+                  const float gas_kg = std::max(id(scale_total_kg_raw).state - empty_kg, 0.0f);
+                  const float gas_pct = std::clamp((gas_kg / nominal_kg) * 100.0f, 0.0f, 100.0f);
+                  return gas_pct <= 10.0f;
+          else:
+            - logger.log:
+                level: WARN
+                format: "HX711-Timeout: Gewichtswerte werden in diesem Zyklus nicht publiziert"
+
+      # 4) Sicherstellen, dass Battery Gauge und Akkuwarnungen aktuell sind
+      - component.update: battery_gauge
+      - delay: 800ms
+      - if:
+          condition:
+            lambda: 'return id(battery_voltage_valid) && id(battery_pct_valid);'
+          then:
+            - sensor.template.publish:
+                id: battery_voltage
+                state: !lambda |-
+                  return id(battery_cache_v);
+            - sensor.template.publish:
+                id: battery_pct
+                state: !lambda |-
+                  return id(battery_cache_pct);
+            - logger.log:
+                format: "Batterie: %.2f V, %.1f %%"
+                args: ["id(battery_cache_v)", "id(battery_cache_pct)"]
+          else:
+            - logger.log:
+                level: WARN
+                format: "MAX17043 lieferte keine vollstaendigen Akkuwerte"
+      - binary_sensor.template.publish:
+          id: battery_low
+          state: !lambda |-
+            return id(battery_pct).has_state() && id(battery_pct).state <= ${battery_low_pct};
+      - delay: 1s
+      - binary_sensor.template.publish:
+          id: battery_critical
+          state: !lambda |-
+            return id(battery_pct).has_state() && id(battery_pct).state <= ${battery_critical_pct};
+
+      # 5) Wartezeit, damit Zigbee TX-Queue die Frames senden kann
+      - logger.log: "Warte auf Zigbee TX (5s)..."
+      - delay: 5000ms
+
+
+      - if:
+          condition:
+            lambda: 'return !${debug_keep_awake};'
+          then:
+            # HX711 in Power-Down und Pin-Hold setzen (Deep Sleep safe)
+            - logger.log: "Zwinge HX711 in Power-Down und aktiviere Pin-Hold..."
+            - lambda: |-
+                #include "driver/gpio.h"
+                gpio_num_t sck_pin = (gpio_num_t)${hx711_sck_pin};
+                gpio_set_direction(sck_pin, GPIO_MODE_OUTPUT);
+                gpio_set_level(sck_pin, 1);
+                gpio_hold_en(sck_pin);
+            # I2C abschalten und schlafen
+            - lambda: |-
+                #include "driver/gpio.h"
+                gpio_set_level(GPIO_NUM_20, 0);
+            - delay: 100ms
+            - deep_sleep.enter: deep_sleep_control
 
 sensor:
   - platform: hx711
     id: scale_total_kg_raw
     internal: true
-    dout_pin: ${hx711_dout_pin}
-    clk_pin: ${hx711_sck_pin}
+    dout_pin: GPIO${hx711_dout_pin}
+    clk_pin: GPIO${hx711_sck_pin}
     gain: 128
-    update_interval: 2s
+    update_interval: 1s
     filters:
       - calibrate_linear:
           - ${calib_raw_no_load} -> ${calib_kg_no_load}
           - ${calib_raw_known} -> ${calib_kg_known}
       - median:
-          window_size: 7
-          send_every: 3
+          window_size: 5
+          send_every: 2
           send_first_at: 1
+    on_value:
+      then:
+        - lambda: |-
+            // Sobald ein gültiger HX711-Wert ankommt, markieren wir readiness
+            id(scale_ready) = true;
+        - logger.log: "HX711 ready: gefilterter Wert empfangen"
 
   - platform: template
     id: scale_total_kg
@@ -133,14 +319,11 @@ sensor:
     accuracy_decimals: 2
     device_class: weight
     state_class: measurement
-    update_interval: 2s # Schneller Update-Takt fuer reaktive HA-Anzeige
-    lambda: |-
-      if (std::isnan(id(scale_total_kg_raw).state)) return {};
-      return id(scale_total_kg_raw).state;
+    update_interval: never
+    force_update: true
+    report: force
     filters:
       - round: 2
-    zigbee_id: zigbee_radio
-    report: force
 
   - platform: max17043
     id: battery_gauge
@@ -151,13 +334,13 @@ sensor:
       id: battery_voltage_raw
       internal: true
       filters:
-        - filter_out: NAN # Unterdrueckt ungueltige Messwerte (NaN)
+        - filter_out: NAN
         - round: 2
       on_value:
         then:
           - lambda: |-
               id(battery_cache_v) = x;
-              id(battery_cache_valid) = true;
+              id(battery_voltage_valid) = true;
     battery_level:
       id: battery_pct_raw
       internal: true
@@ -171,7 +354,7 @@ sensor:
         then:
           - lambda: |-
               id(battery_cache_pct) = x;
-              id(battery_cache_valid) = true;
+              id(battery_pct_valid) = true;
 
   - platform: template
     id: battery_voltage
@@ -181,19 +364,11 @@ sensor:
     device_class: voltage
     state_class: measurement
     entity_category: diagnostic
-    update_interval: 30s
-    lambda: |-
-      if (id(battery_voltage_raw).has_state() && !std::isnan(id(battery_voltage_raw).state)) {
-        return id(battery_voltage_raw).state;
-      }
-      if (id(battery_cache_valid)) {
-        return id(battery_cache_v);
-      }
-      return 0.0f;
+    update_interval: never
+    force_update: true
+    report: force
     filters:
       - round: 2
-    zigbee_id: zigbee_radio
-    report: force
 
   - platform: template
     id: battery_pct
@@ -203,19 +378,11 @@ sensor:
     device_class: battery
     state_class: measurement
     entity_category: diagnostic
-    update_interval: 30s
-    lambda: |-
-      if (id(battery_pct_raw).has_state() && !std::isnan(id(battery_pct_raw).state)) {
-        return id(battery_pct_raw).state;
-      }
-      if (id(battery_cache_valid)) {
-        return id(battery_cache_pct);
-      }
-      return 0.0f;
+    update_interval: never
+    force_update: true
+    report: force
     filters:
       - round: 1
-    zigbee_id: zigbee_radio
-    report: force
 
   - platform: template
     id: gas_weight_kg
@@ -224,16 +391,11 @@ sensor:
     accuracy_decimals: 2
     device_class: weight
     state_class: measurement
-    update_interval: 2s # Schneller Update-Takt
-    lambda: |-
-      if (std::isnan(id(scale_total_kg_raw).state)) return {};
-      float gas = id(scale_total_kg_raw).state - ${bottle_empty_kg}f;
-      if (gas < 0.0f) return 0.0f;
-      return gas;
+    update_interval: never
+    force_update: true
+    report: force
     filters:
       - round: 2
-    zigbee_id: zigbee_radio
-    report: force
 
   - platform: template
     id: gas_fill_pct
@@ -242,58 +404,38 @@ sensor:
     accuracy_decimals: 2
     state_class: measurement
     icon: mdi:propane-tank
-    update_interval: 2s # Schneller Update-Takt
-    lambda: |-
-      if (std::isnan(id(gas_weight_kg).state)) return {};
-      float pct = (id(gas_weight_kg).state / ${gas_nominal_kg}) * 100.0f;
-      return std::clamp(pct, 0.0f, 100.0f);
+    update_interval: never
+    force_update: true
+    report: force
     filters:
       - round: 2
-    zigbee_id: zigbee_radio
-    report: force
 
 binary_sensor:
   - platform: template
     id: gas_low_20
     name: "${friendly_name} Gas niedrig"
     device_class: problem
-    lambda: |-
-      if (std::isnan(id(gas_fill_pct).state)) return false;
-      return id(gas_fill_pct).state <= 20.0f;
-    zigbee_id: zigbee_radio
     report: force
 
   - platform: template
     id: gas_critical_10
     name: "${friendly_name} Gas kritisch"
     device_class: problem
-    lambda: |-
-      if (std::isnan(id(gas_fill_pct).state)) return false;
-      return id(gas_fill_pct).state <= 10.0f;
-    zigbee_id: zigbee_radio
     report: force
 
   - platform: template
     id: battery_low
     name: "${friendly_name} Akku niedrig"
     device_class: battery
-    lambda: |-
-      if (std::isnan(id(battery_pct).state)) return false; // NaN als false behandeln
-      return id(battery_pct).state <= ${battery_low_pct};
-    zigbee_id: zigbee_radio
     report: force
 
   - platform: template
     id: battery_critical
     name: "${friendly_name} Akku kritisch"
     device_class: battery
-    lambda: |-
-      if (std::isnan(id(battery_pct).state)) return false; // NaN als false behandeln
-      return id(battery_pct).state <= ${battery_critical_pct};
-    zigbee_id: zigbee_radio
     report: force
 
 interval:
   - interval: 30s
     then:
-      - component.update: battery_gauge
+      - script.execute: publish_after_zigbee_join
