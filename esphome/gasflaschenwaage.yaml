@@ -124,38 +124,6 @@ script:
           condition:
             lambda: 'return id(zigbee_radio).is_joined();'
           then:
-            # Ensure every Zigbee attribute changes after the coordinator is ready.
-            - sensor.template.publish:
-                id: scale_total_kg
-                state: -1.0
-            - sensor.template.publish:
-                id: gas_weight_kg
-                state: -1.0
-            - sensor.template.publish:
-                id: gas_fill_pct
-                state: -1.0
-            - sensor.template.publish:
-                id: battery_voltage
-                state: -1.0
-            - sensor.template.publish:
-                id: battery_pct
-                state: -1.0
-            - binary_sensor.template.publish:
-                id: gas_low_20
-                state: false
-            - delay: 1s
-            - binary_sensor.template.publish:
-                id: gas_critical_10
-                state: false
-            - delay: 1s
-            - binary_sensor.template.publish:
-                id: battery_low
-                state: true
-            - delay: 1s
-            - binary_sensor.template.publish:
-                id: battery_critical
-                state: true
-            - delay: 1s
             - script.execute: publish_then_sleep
           else:
             - logger.log:
@@ -182,7 +150,7 @@ script:
             lambda: 'return id(scale_ready);'
           timeout: 10s
 
-      # 3) Gewicht und Gaswarnungen nur mit bestaetigter HX711-Messung publizieren
+      # 3) Gewichtswerte nur mit bestaetigter HX711-Messung publizieren
       - if:
           condition:
             lambda: 'return id(scale_ready);'
@@ -205,35 +173,16 @@ script:
                   const float gas_kg = std::max(id(scale_total_kg_raw).state - empty_kg, 0.0f);
                   return std::clamp((gas_kg / nominal_kg) * 100.0f, 0.0f, 100.0f);
             - logger.log:
-                format: "Gas: %.2f kg, %.1f %%, niedrig=%s, kritisch=%s"
+                format: "Gas: %.2f kg, %.1f %%"
                 args:
                   - "std::max(id(scale_total_kg_raw).state - ${bottle_empty_kg}f, 0.0f)"
                   - "std::clamp((std::max(id(scale_total_kg_raw).state - ${bottle_empty_kg}f, 0.0f) / ${gas_nominal_kg}f) * 100.0f, 0.0f, 100.0f)"
-                  - "std::clamp((std::max(id(scale_total_kg_raw).state - ${bottle_empty_kg}f, 0.0f) / ${gas_nominal_kg}f) * 100.0f, 0.0f, 100.0f) <= 20.0f ? \"true\" : \"false\""
-                  - "std::clamp((std::max(id(scale_total_kg_raw).state - ${bottle_empty_kg}f, 0.0f) / ${gas_nominal_kg}f) * 100.0f, 0.0f, 100.0f) <= 10.0f ? \"true\" : \"false\""
-            - binary_sensor.template.publish:
-                id: gas_low_20
-                state: !lambda |-
-                  const float empty_kg = ${bottle_empty_kg}f;
-                  const float nominal_kg = ${gas_nominal_kg}f;
-                  const float gas_kg = std::max(id(scale_total_kg_raw).state - empty_kg, 0.0f);
-                  const float gas_pct = std::clamp((gas_kg / nominal_kg) * 100.0f, 0.0f, 100.0f);
-                  return gas_pct <= 20.0f;
-            - delay: 1s
-            - binary_sensor.template.publish:
-                id: gas_critical_10
-                state: !lambda |-
-                  const float empty_kg = ${bottle_empty_kg}f;
-                  const float nominal_kg = ${gas_nominal_kg}f;
-                  const float gas_kg = std::max(id(scale_total_kg_raw).state - empty_kg, 0.0f);
-                  const float gas_pct = std::clamp((gas_kg / nominal_kg) * 100.0f, 0.0f, 100.0f);
-                  return gas_pct <= 10.0f;
           else:
             - logger.log:
                 level: WARN
                 format: "HX711-Timeout: Gewichtswerte werden in diesem Zyklus nicht publiziert"
 
-      # 4) Sicherstellen, dass Battery Gauge und Akkuwarnungen aktuell sind
+      # 4) Sicherstellen, dass Battery Gauge aktuell ist
       - component.update: battery_gauge
       - delay: 800ms
       - if:
@@ -255,15 +204,6 @@ script:
             - logger.log:
                 level: WARN
                 format: "MAX17043 lieferte keine vollstaendigen Akkuwerte"
-      - binary_sensor.template.publish:
-          id: battery_low
-          state: !lambda |-
-            return id(battery_pct).has_state() && id(battery_pct).state <= ${battery_low_pct};
-      - delay: 1s
-      - binary_sensor.template.publish:
-          id: battery_critical
-          state: !lambda |-
-            return id(battery_pct).has_state() && id(battery_pct).state <= ${battery_critical_pct};
 
       # 5) Wartezeit, damit Zigbee TX-Queue die Frames senden kann
       - logger.log: "Warte auf Zigbee TX (5s)..."
@@ -409,31 +349,6 @@ sensor:
     report: force
     filters:
       - round: 2
-
-binary_sensor:
-  - platform: template
-    id: gas_low_20
-    name: "${friendly_name} Gas niedrig"
-    device_class: problem
-    report: force
-
-  - platform: template
-    id: gas_critical_10
-    name: "${friendly_name} Gas kritisch"
-    device_class: problem
-    report: force
-
-  - platform: template
-    id: battery_low
-    name: "${friendly_name} Akku niedrig"
-    device_class: battery
-    report: force
-
-  - platform: template
-    id: battery_critical
-    name: "${friendly_name} Akku kritisch"
-    device_class: battery
-    report: force
 
 interval:
   - interval: 30s
