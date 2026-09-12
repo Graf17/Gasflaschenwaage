@@ -4,7 +4,7 @@ substitutions:
 
   # Low-power Zyklus
   awake_max_duration: 5min
-  sleep_duration: 10min
+  sleep_duration: 24h
   debug_keep_awake: "false"
 
   # HX711-Pins
